@@ -14,11 +14,11 @@ Recalibrate the thresholds for
 
 //For demo/debugging
 #define DEMO_MODE
-#define VERBOSE 2 //Higher number is more verbose. Ranges from [0-3], with 0 being only errors shown, and 3 being insane amounts of output.
+#define VERBOSE 1 //Higher number is more verbose. Ranges from [0-3], with 0 being only errors shown, and 3 being insane amounts of output.
 
 //For integration and adjustments
 #define CALIBRATE_AT_SUNRISE_SUNSET true
-#define INVERT_MOTOR_OFF_STATE false
+#define INVERT_MOTOR_OFF_STATE true
 #define INITIAL_LOW_LIGHT_THRESHOLD 50
 #define INITIAL_HIGH_LIGHT_THRESHOLD 500
 #define UP_PIN 1
@@ -27,18 +27,19 @@ Recalibrate the thresholds for
 #define MOTOR_PIN_2 5
 #define PHOTORESISTOR_PIN A6
 #define SETUP_LED_PIN 14
+#define MOTOR_STRENGTH_ADJUSTMENT_CONSTANT 1.02 //Numbers above 1 counteract the 'top' getting lower, numbers below 1 counteract the 'top' getting higher.
 
 //For changing fundamental system behavior
 #ifdef DEMO_MODE
 //Special definitions so that the product can be demo'ed easily
-#define MINS_PER_SAMPLE_INTERVAL 1
+#define MOVING_AVERAGE_INTERVAL_SECONDS 30
 #define PHYSICAL_INTERACTION_LOCKOUT_SECONDS 30
 #endif
 
 #ifndef DEMO_MODE
 //Normal operation
-#define MINS_PER_SAMPLE_INTERVAL 5 //How long do we record data for our moving average
-#define PHYSICAL_INTERACTION_LOCKOUT_SECONDS 60 * 60 //One hour
+#define MOVING_AVERAGE_INTERVAL_SECONDS (5 * 60)
+#define PHYSICAL_INTERACTION_LOCKOUT_SECONDS (60 * 60) //One hour
 #endif
 
 #define INVERT_SHADE_LIGHT_BEHAVIOR false //when false, shades will raise when bright, and lower when dim. When true, shades will lower when bright, and raise when dim.
@@ -50,7 +51,7 @@ Recalibrate the thresholds for
 #define LOOPS_UNTIL_DOUBLEPRESS_REGISTERED (((MS_UNTIL_DOUBLEPRESS_REGISTERED - LOOP_INTERVAL) / LOOP_INTERVAL) + 1)
 #define LOOPS_UNTIL_BUTTON_PRESS_REGISTERED (((MS_UNTIL_BUTTON_PRESS_REGISTERED - LOOP_INTERVAL) / LOOP_INTERVAL) + 1)
 #define LOOPS_PER_PHOTORESISTOR_SAMPLE (PHOTORESISTOR_SAMPLE_INTERVAL_MS / LOOP_INTERVAL)
-#define SAMPLES_TO_KEEP ((1000 * 60 * MINS_PER_SAMPLE_INTERVAL) / PHOTORESISTOR_SAMPLE_INTERVAL_MS)
+#define SAMPLES_TO_KEEP ((1000 * MOVING_AVERAGE_INTERVAL_SECONDS) / PHOTORESISTOR_SAMPLE_INTERVAL_MS)
 #define MOTOR_MICROS_MARGIN (1000 * LOOP_INTERVAL * 2)
 
 enum FSM_State {
@@ -128,7 +129,9 @@ void loop() {
   //Static Stuff
   static uint32_t up_active_loop_count = 0;
   static uint32_t down_active_loop_count = 0;
+  static uint32_t loop_counter = 0; //Just for printing, you can ignore this.
 
+  loop_counter++;
   //Count loops active for each button
   up_active_loop_count++;
   up_active_loop_count *= (up_button_state == HIGH); //Resets to zero if button is not pressed
@@ -158,6 +161,10 @@ void loop() {
   if (USE_WATCHDOG) {
     Watchdog.reset();
     log(3, "Reset Watchdog\n");
+  }
+  if (loop_counter % 100 == 0) {
+    log(1, "photoresistor avg: %d\n", photoresistor_avg);
+    log(1, "time since last physical interaction: %d\n", (millis() - mils_at_last_physical_interaction) / 1000);
   }
   delay(LOOP_INTERVAL);
   log(3, "---- LOOP END ----\n");
@@ -483,7 +490,7 @@ void setMotor(Motor_Direction direction){
     //Now we can assume that last_motor_command is either -1 or 1, so we can do math! (-1 is down, 1 is up)
     int motor_offset = motor_on_time * -1 * (int)last_motor_command; //If commmand was up, then offset will be negative. (otherwise unchanged)
     log(3, "Applying offset of %d | old micros_motor_lowered: %d | new micros_motor_lowered: %d\n",motor_offset, micros_motor_lowered, micros_motor_lowered + motor_offset);
-    micros_motor_lowered += motor_offset;
+    micros_motor_lowered += (motor_offset * MOTOR_STRENGTH_ADJUSTMENT_CONSTANT);
     if (motor_cycle_counter % 100 == 0) {
       log(2, "Motor Update | micros_motor_lowered = %d\n", micros_motor_lowered);
     }
