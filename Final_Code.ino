@@ -175,6 +175,7 @@ void loop() {
   motor_action = Motor_OFF;
   log(2, "Entering FSM... Current State: %d | up_active: %d | down_active: %d | buttons_changing: %d | photoresistor_avg: %d | micros_motor_lowered: %d | max_lower: %d\n",
     curr_system_state, up_active, down_active, buttons_changing, photoresistor_avg, micros_motor_lowered, max_motor_lower_micros);
+
   switch (curr_system_state) {
     case S_INIT: //State 1
       //There's no logic here, INIT always goes into SETUP_MAX
@@ -183,6 +184,7 @@ void loop() {
       log(1, "Transitioning from S_INIT to S_SETUP_MAX\n");
       break;
     case S_SETUP_MAX:
+    case S_SETUP_MIN:
       //Within the state, react to buttons
       if (buttons_changing) {
         break; //While buttons are changing, nothing should be happening
@@ -192,23 +194,13 @@ void loop() {
       } else if (!up_active && down_active) {
         motor_action = Motor_DOWN;
       }
-      //Only one transition out: transition to S_SETUP_MIN when doublepress is detected
       if (up_active_loop_count > LOOPS_UNTIL_DOUBLEPRESS_REGISTERED && down_active_loop_count > LOOPS_UNTIL_DOUBLEPRESS_REGISTERED) {
+        //DOUBLEPRESS!
         log(1, "Transitioning from S_SETUP_MAX to S_SETUP_MIN\n");
         curr_system_state = S_SETUP_MIN;
         //Not much to record here, because the minimum is implicitly zero, and we are at the lowering minimum.
       } else {
         log(3, "Not transitioning out of S_SETUP_MAX\n");
-      }
-      break;
-    case S_SETUP_MIN:
-      //Only one transition out: transition to S_WAIT when doublepress is detected
-      if (buttons_changing == false && up_active_loop_count > LOOPS_UNTIL_DOUBLEPRESS_REGISTERED && down_active_loop_count > LOOPS_UNTIL_DOUBLEPRESS_REGISTERED) {
-        log(1, "Transitioning from S_SETUP_MIN to S_WAIT\n");
-        curr_system_state = S_WAIT;
-        max_motor_lower_micros = micros_motor_lowered; //Record the minimum height
-      } else {
-        log(3, "Not transitioning out of S_SETUP_MIN\n");
       }
       break;
     case S_WAIT:
