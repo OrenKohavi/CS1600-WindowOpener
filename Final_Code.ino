@@ -21,9 +21,8 @@ Recalibrate the thresholds for
 #define INVERT_MOTOR_OFF_STATE false
 #define INITIAL_LOW_LIGHT_THRESHOLD 50
 #define INITIAL_HIGH_LIGHT_THRESHOLD 500
-#define INVERT_MOTOR_DIR false
-#define UP_PIN 0
-#define DOWN_PIN 1
+#define UP_PIN 1
+#define DOWN_PIN 0
 #define MOTOR_PIN_1 4
 #define MOTOR_PIN_2 5
 #define PHOTORESISTOR_PIN A6
@@ -31,16 +30,16 @@ Recalibrate the thresholds for
 
 //For changing fundamental system behavior
 #define USE_WATCHDOG false
-#define LOOP_INTERVAL 10 //ms delay between loops
+#define LOOP_INTERVAL 5 //ms delay between loops
 #define MINS_PER_SAMPLE_INTERVAL 5 //How long do we record data for our moving average
 #define MS_UNTIL_DOUBLEPRESS_REGISTERED 1500
 #define PHOTORESISTOR_SAMPLE_INTERVAL_MS 100 //ms between light sensor samples
 #define MS_UNTIL_BUTTON_PRESS_REGISTERED 50
-#define LOOPS_UNTIL_DOUBLEPRESS_REGISTERED (MS_UNTIL_DOUBLEPRESS_REGISTERED / LOOP_INTERVAL)
-#define LOOPS_UNTIL_BUTTON_PRESS_REGISTERED (MS_UNTIL_BUTTON_PRESS_REGISTERED / LOOP_INTERVAL)
+#define LOOPS_UNTIL_DOUBLEPRESS_REGISTERED (((MS_UNTIL_DOUBLEPRESS_REGISTERED - LOOP_INTERVAL) / LOOP_INTERVAL) + 1)
+#define LOOPS_UNTIL_BUTTON_PRESS_REGISTERED (((MS_UNTIL_BUTTON_PRESS_REGISTERED - LOOP_INTERVAL) / LOOP_INTERVAL) + 1)
 #define LOOPS_PER_PHOTORESISTOR_SAMPLE (PHOTORESISTOR_SAMPLE_INTERVAL_MS / LOOP_INTERVAL)
 #define SAMPLES_TO_KEEP ((1000 * 60 * MINS_PER_SAMPLE_INTERVAL) / PHOTORESISTOR_SAMPLE_INTERVAL_MS)
-#define MOTOR_MICROS_MARGIN (1000 * LOOP_INTERVAL)
+#define MOTOR_MICROS_MARGIN (1000 * LOOP_INTERVAL * 2)
 
 enum FSM_State {
   S_INIT,
@@ -56,8 +55,9 @@ enum FSM_State {
 
 enum Motor_Direction {
   Motor_OFF = 0,
-  Motor_UP = -1,
-  Motor_DOWN = 1,
+  Motor_UP = 1,
+  Motor_DOWN = -1,
+  Motor_ERR = 0xFF,
 };
 
 //Globals
@@ -67,11 +67,10 @@ uint32_t sample_arr_idx = 0;
 uint32_t mils_at_last_physical_interaction;
 uint32_t micros_at_motor_start;
 uint32_t micros_at_motor_end;
-uint32_t micros_motor_lowered; //counts the number of microseconds that the motor has been lowering (i.e. this tracks how far from the top we are)
-uint32_t micros_motor_lowered_max; //Maximum micros of height the motor can be at (calibrated during setup)
+int32_t micros_motor_lowered; //counts the number of microseconds that the motor has been lowering (i.e. this tracks how far from the top we are)
+int32_t micros_motor_lowered_max; //Maximum micros of height the motor can be at (calibrated during setup)
 PinStatus up_button_state;
 PinStatus down_button_state;
-Motor_Direction last_motor_command = Motor_OFF;
 
 void setup() {
   Serial.begin(9600);
@@ -130,13 +129,17 @@ void loop() {
   bool down_active = down_active_loop_count >= LOOPS_UNTIL_BUTTON_PRESS_REGISTERED;
   bool buttons_changing = (!up_active && up_active_loop_count > 0) || (!down_active && down_active_loop_count > 0);
   Motor_Direction motor_action = Motor_OFF;
+
+  log(3, "Up active loop count: %d | down_active_loop_count: %d\n", up_active_loop_count, down_active_loop_count);
   
   if (!up_active && !down_active) {
     doublepress_transition_allowed = true;
     doublepress_happened = false;
+    log(3, "Both buttons free\n");
   }
   if (up_active && down_active) {
     doublepress_happened = true;
+    log(3, "Doublepress detected\n");
   }
 
   //Get reading from photoresistor, and calculate moving average
@@ -176,10 +179,11 @@ void loop() {
   log(3, "Entering FSM... Current State: %d | up_active: %d | down_active: %d | buttons_changing: %d | photoresistor_avg: %d | micros_motor_lowered: %d | max_lower: %d\n",
     curr_system_state, up_active, down_active, buttons_changing, photoresistor_avg, micros_motor_lowered, micros_motor_lowered_max);
 
+  FSM_State next_system_state = curr_system_state;
   switch (curr_system_state) {
     case S_INIT: //State 1
       //There's no logic here, INIT always goes into SETUP_MAX
-      curr_system_state = S_SETUP_MAX;
+      next_system_state = S_SETUP_MAX;
       digitalWrite(SETUP_LED_PIN, HIGH);
       log(1, "Transitioning from S_INIT to S_SETUP_MAX\n");
       break;
@@ -205,7 +209,7 @@ void loop() {
           doublepress_transition_allowed = false; //To prevent us from immidiatley switching out of S_SETUP_MIN right after this transition
           led_quick_flash(); //let the user know their action was successful
           digitalWrite(SETUP_LED_PIN, HIGH); //LED should still stay on for S_SETUP_MIN
-          curr_system_state = S_SETUP_MIN;
+          next_system_state = S_SETUP_MIN;
           //Not much to record here, because the minimum is implicitly zero, and we are at the minimum.
         } else if (curr_system_state == S_SETUP_MIN) {
           //Transition to S_WAIT
@@ -217,13 +221,13 @@ void loop() {
           if (MOTOR_MICROS_MARGIN >= micros_motor_lowered_max) { //MOTOR_MICROS_MARGIN is basically our zero -- it's the smallest step of motor precision that we have
             //Seems like the high and low limits are either the same, or inverted -- Not good, switch into error state.
             log(0, "Maximum and Minimum height not set correctly -- Power cycle to redo setup\n");
-            curr_system_state = S_UNRECOVERABLE_ERROR;
+            next_system_state = S_UNRECOVERABLE_ERROR;
           } else {
             log(2, "Safety check passed\n");
             log(1, "Transitioning from S_SETUP_MIN to S_WAIT\n");
             led_quick_flash(); //let the user know their action was successful
             digitalWrite(SETUP_LED_PIN, LOW); //LED should now be off for S_WAIT
-            curr_system_state = S_WAIT;
+            next_system_state = S_WAIT;
           }
         } else {
           //Something's gone wrong, because we're only supposed to be in one of these states.
@@ -246,7 +250,10 @@ void loop() {
           //There's still room to go before we hit the top, so all good.
           log(2, "Safety check passed\n");
           log(1, "Transitioning from S_WAIT to S_BUTTON_UP\n");
-          curr_system_state = S_BUTTON_UP;
+          next_system_state = S_BUTTON_UP;
+        } else {
+          log(2, "Shade at maximum height\n");
+          next_system_state = S_WAIT;
         }
       } else if (!up_active && down_active) {
         log(2, "Down button pressed\n");
@@ -254,8 +261,14 @@ void loop() {
           //There's still room to go before we hit the bottom, so all good.
           log(2, "Safety check passed\n");
           log(1, "Transitioning from S_WAIT to S_BUTTON_DOWN\n");
-          curr_system_state = S_BUTTON_DOWN;
+          next_system_state = S_BUTTON_DOWN;
+        } else {
+          log(2, "Shade at minimum height\n");
+          next_system_state = S_WAIT;
         }
+      } else {
+        log(3, "No buttons active, staying in S_WAIT\n");
+        next_system_state = S_WAIT;
       }
       break;
     case S_BUTTON_UP:
@@ -263,15 +276,43 @@ void loop() {
         //Go back to the wait state (wait state can figure out stuff like double-presses, so no need to duplicate that logic here)
         log(1, "Transitioning from S_BUTTON_UP to S_WAIT");
         motor_action = Motor_OFF;
-        curr_system_state = S_WAIT;
+        next_system_state = S_WAIT;
       } else {
-        //Remain in the S_BUTTON_UP state, and command the motor to go up
-        log(2, "Staying in S_BUTTON_UP");
-        motor_action = Motor_UP;
-        curr_system_state = S_BUTTON_UP; //Probably redundant, but whatever it doesn't hurt
+        //Check shade position to make sure it's safe to keep going up:
+        if (micros_motor_lowered > MOTOR_MICROS_MARGIN){
+          //Remain in the S_BUTTON_UP state, and command the motor to go up
+          log(2, "Staying in S_BUTTON_UP");
+          motor_action = Motor_UP;
+          next_system_state = S_BUTTON_UP; //Probably redundant, but whatever it doesn't hurt
+        } else {
+          log(1, "Shade at maximum height, transitioning from S_BUTTON_UP to S_WAIT\n");
+          log(2, "micros_motor_lowered: %d\n", micros_motor_lowered);
+          motor_action = Motor_OFF;
+          next_system_state = S_WAIT;
+        }
       }
       break;
     case S_BUTTON_DOWN:
+      //Basically the same as S_BUTTON_UP
+      if (doublepress_happened || !down_active) {
+        //Go back to the wait state (wait state can figure out stuff like double-presses, so no need to duplicate that logic here)
+        log(1, "Transitioning from S_BUTTON_DOWN to S_WAIT");
+        motor_action = Motor_OFF;
+        next_system_state = S_WAIT;
+      } else {
+        //Check shade position to make sure it's safe to keep going down:
+        if (micros_motor_lowered + MOTOR_MICROS_MARGIN < micros_motor_lowered_max){
+          //Remain in the S_BUTTON_DOWN state, and command the motor to go down
+          log(2, "Staying in S_BUTTON_DOWN");
+          motor_action = Motor_DOWN;
+          next_system_state = S_BUTTON_DOWN; //Probably redundant, but whatever it doesn't hurt
+        } else {
+          log(1, "Shade at maximum height, transitioning from S_BUTTON_DOWN to S_WAIT\n");
+          log(2, "micros_motor_lowered: %d | threshold (micros_motor_lowered_max): %d\n", micros_motor_lowered, micros_motor_lowered_max);
+          motor_action = Motor_OFF;
+          next_system_state = S_WAIT;
+        }
+      }
       break;
     case S_LIGHT_UP:
       break;
@@ -280,16 +321,13 @@ void loop() {
     case S_UNRECOVERABLE_ERROR:
       //For cases where the device was setup wrong, or otherwise needs to be power cycled
       //Just blink the LED and disable the device by going into an infinite loop
-      while(true) {
-        digitalWrite(SETUP_LED_PIN, LOW);
-        delay(250);
-        digitalWrite(SETUP_LED_PIN, HIGH);
-        delay(250);
-      }
+      setMotor(Motor_OFF); //Make sure motor is not still running
+      error_loop();
       break;
     default:
       log(0, "ERROR: Unrecognized State of: %d\n", curr_system_state);
   };
+  curr_system_state = next_system_state;
   log(3, "After FSM, state is: %d\n", curr_system_state);
 
   //End of the loop -- Reset the Watchdog and apply motor action.
@@ -302,27 +340,55 @@ void loop() {
 }
 
 void setMotor(Motor_Direction direction){
-  if (INVERT_MOTOR_DIR) {
-    direction = (Motor_Direction)((int)direction * -1); //flip from UP to DOWN without modifying the zero state (which is OFF)
-  }
+  static bool tracking_movement = false;
+  static uint32_t micros_at_movement;
+  static Motor_Direction last_motor_command = Motor_OFF;
   if (last_motor_command == Motor_OFF && direction != Motor_OFF){
     //Motor just changed from off into some other state, log it with less verbosity required
     log(1, "Motor Recieved New Command: %d\n", direction);
+    //set micros_at_movement_start
   } else {
     log(3, "Motor Command Recieved: %d\n", direction);
   }
-  last_motor_command = direction;
+  //Some sanity checking to make sure the motor stops before it turns in the opposite direction
+  //This also lets us greatly simplify the micros-based logic
+  if (abs(last_motor_command) == 1 && abs(direction) == 1 && last_motor_command != direction) {
+    //Bad, because this means the motor is switching directions without stopping
+    //Not only will this mess up the micros-based counter, but this behavior never happens in the FSM, so it's an error
+    log(0, "Motor recieved opposite-direction commands without a stop inbetweeen (last command: %d, this command: %d) | Unrecoverable Error\n", last_motor_command, direction);
+    direction = Motor_ERR; //Make sure it's not a defined direction, so that we go into the error case 
+  }
+  if (tracking_movement) {
+    log(2, "Moving in direction %d, calculating offset change\n", last_motor_command);
+    uint32_t time_now = micros();
+    uint32_t motor_on_time = time_now - micros_at_movement;
+    //TODO: Handle overflow of micros(), which happens every hour-ish
+    log(2, "Calculated that this movement step has been ocurring for %d micros\n", motor_on_time);
+    if (abs((int)last_motor_command) != 1) {
+      log(0, "ERROR: last_motor_command was not a direction, so cannot calculate motor offset | Unrecoverable Error\n");
+      tracking_movement = false;
+      setMotor(Motor_ERR);
+    }
+    //Now we can assume that last_motor_command is either -1 or 1, so we can do math! (-1 is down, 1 is up)
+    int motor_offset = motor_on_time * -1 * (int)last_motor_command; //If commmand was up, then offset will be negative. (otherwise unchanged)
+    log(2, "Applying offset of %d | old micros_motor_lowered: %d | new micros_motor_lowered: %d\n",motor_offset, micros_motor_lowered, micros_motor_lowered + motor_offset);
+    micros_motor_lowered += motor_offset;
+  }
   switch (direction) {
     case Motor_UP:
+      tracking_movement = true;
+      micros_at_movement = micros(); //Potentially, put some logic in here that decrements micros_at_movement by the amount of time it takes for the tracking_movement block to execute?
       digitalWrite(MOTOR_PIN_1, HIGH);
       digitalWrite(MOTOR_PIN_2, LOW);
       break;
     case Motor_DOWN:
+      tracking_movement = true;
+      micros_at_movement = micros();
       digitalWrite(MOTOR_PIN_1, LOW);
       digitalWrite(MOTOR_PIN_2, HIGH);
       break;
     case Motor_OFF:
-    default:
+      tracking_movement = false;
       if (INVERT_MOTOR_OFF_STATE){
         digitalWrite(MOTOR_PIN_1, HIGH);
         digitalWrite(MOTOR_PIN_2, HIGH);
@@ -330,9 +396,25 @@ void setMotor(Motor_Direction direction){
         digitalWrite(MOTOR_PIN_1, LOW);
         digitalWrite(MOTOR_PIN_2, LOW);
       }
-
+      break;
+    default:
+      log(0, "ERROR: Unrecognized motor state of %d | Unrecoverable error\n", direction);
+      //no break, we want to pass into the error case
+    case Motor_ERR:
+      log(1, "Unrecoverable Error in Motor\n");
+      //Make sure motor is off before going into error state
+      if (INVERT_MOTOR_OFF_STATE){
+        digitalWrite(MOTOR_PIN_1, HIGH);
+        digitalWrite(MOTOR_PIN_2, HIGH);
+      } else {
+        digitalWrite(MOTOR_PIN_1, LOW);
+        digitalWrite(MOTOR_PIN_2, LOW);
+      }
+      curr_system_state = S_UNRECOVERABLE_ERROR;
+      error_loop();
       break;
   };
+  last_motor_command = direction;
 }
 
 void Button_ISR() {
