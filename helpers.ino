@@ -40,13 +40,14 @@ void errorLoop() {
     delay(250);
     digitalWrite(SETUP_LED_PIN, HIGH);
     delay(250);
+    Watchdog.reset(); //Better to keep the system alive, so the user knows there's been an error
   }
 }
 
-int enable_watchdog(int time) {
-
+bool shade_not_at_max() {
+  return micros_motor_lowered > MOTOR_MICROS_MARGIN;
 }
 
-void pet_watchdog() {
-
+bool shade_not_at_min() {
+  return (micros_motor_lowered + MOTOR_MICROS_MARGIN) < micros_motor_lowered_max;  
 }

@@ -33,14 +33,17 @@ Recalibrate the thresholds for
 //Special definitions so that the product can be demo'ed easily
 #define MINS_PER_SAMPLE_INTERVAL 1
 #define PHYSICAL_INTERACTION_LOCKOUT_SECONDS 30
-#else
+#endif
+
+#ifndef DEMO_MODE
 //Normal operation
 #define MINS_PER_SAMPLE_INTERVAL 5 //How long do we record data for our moving average
 #define PHYSICAL_INTERACTION_LOCKOUT_SECONDS 60 * 60 //One hour
 #endif
 
-#define USE_WATCHDOG false
-#define LOOP_INTERVAL 5 //ms delay between loops
+#define INVERT_SHADE_LIGHT_BEHAVIOR false //when false, shades will raise when bright, and lower when dim. When true, shades will lower when bright, and raise when dim.
+#define USE_WATCHDOG true
+#define LOOP_INTERVAL 5 //ms delay between loops (At 2ms and below, behavior starts getting funky)
 #define MS_UNTIL_DOUBLEPRESS_REGISTERED 1500
 #define PHOTORESISTOR_SAMPLE_INTERVAL_MS 100 //ms between light sensor samples
 #define MS_UNTIL_BUTTON_PRESS_REGISTERED 60
@@ -51,7 +54,7 @@ Recalibrate the thresholds for
 #define MOTOR_MICROS_MARGIN (1000 * LOOP_INTERVAL * 2)
 
 enum FSM_State {
-  S_INIT,
+  S_INIT = 1,
   S_SETUP_MAX,
   S_SETUP_MIN,
   S_WAIT,
@@ -71,6 +74,8 @@ enum Motor_Direction {
 
 //Globals
 FSM_State curr_system_state = S_INIT;
+uint16_t photoresistor_bright_threshold = INITIAL_HIGH_LIGHT_THRESHOLD;
+uint16_t photoresistor_dim_threshold = INITIAL_LOW_LIGHT_THRESHOLD;
 uint16_t sample_arr[SAMPLES_TO_KEEP];
 uint32_t sample_arr_idx = 0;
 uint32_t mils_at_last_physical_interaction;
@@ -113,19 +118,16 @@ void setup() {
 
   //Enable watchdog (So that things like WiFi connection don't cause the WDT to accidentaly trigger)
   if (USE_WATCHDOG) {
-    int watchdog_time = Watchdog.enable(LOOP_INTERVAL * 2); //ms before watchdog kicks
-    Serial.print("Enabled the watchdog with a time of: ");
-    Serial.print(watchdog_time, DEC);
-    Serial.println();
+    int watchdog_time = Watchdog.enable(max(1000, LOOP_INTERVAL * 4));
+    log(1, "Enabled WDT with period of %d\n", watchdog_time);
   }
+  log(1, "Startup Completed\n");
 }
 
 void loop() {
   //Static Stuff
   static uint32_t up_active_loop_count = 0;
   static uint32_t down_active_loop_count = 0;
-  static bool doublepress_happened; //gets set to true when a doublepress occurrs, and should prevent motor movement if true.
-  static bool doublepress_transition_allowed; //Set to false when a doublepress triggers a transition, and is only reset to true when no buttons are being clicked.
 
   //Count loops active for each button
   up_active_loop_count++;
@@ -138,15 +140,6 @@ void loop() {
   Motor_Direction motor_action = Motor_OFF;
   log(3, "Up active loop count: %d | down_active_loop_count: %d\n", up_active_loop_count, down_active_loop_count);
   //Set some variables based on which buttons are up/down
-  if (!up_active && !down_active) {
-    doublepress_transition_allowed = true;
-    doublepress_happened = false;
-    log(3, "Both buttons free\n");
-  }
-  if (up_active && down_active) {
-    doublepress_happened = true;
-    log(3, "Doublepress detected\n");
-  }
 
   uint32_t photoresistor_avg = readPhotoresistor();
 
@@ -157,13 +150,14 @@ void loop() {
 
   log(3, "Before FSM, Current State: %d | up_active: %d | down_active: %d | buttons_changing: %d | photoresistor_avg: %d | micros_motor_lowered: %d | max_lower: %d\n",
     curr_system_state, up_active, down_active, buttons_changing, photoresistor_avg, micros_motor_lowered, micros_motor_lowered_max);
-  motor_action = fsmUpdate(up_active, down_active, buttons_changing, photoresistor_avg, doublepress_happened, doublepress_transition_allowed, up_active_loop_count, down_active_loop_count);
+  motor_action = fsmUpdate(up_active, down_active, buttons_changing, photoresistor_avg, up_active_loop_count, down_active_loop_count);
   log(3, "After FSM, state is: %d\n", curr_system_state);
   setMotor(motor_action);
 
   //End of the loop -- Reset the Watchdog and delay
   if (USE_WATCHDOG) {
     Watchdog.reset();
+    log(3, "Reset Watchdog\n");
   }
   delay(LOOP_INTERVAL);
   log(3, "---- LOOP END ----\n");
@@ -173,10 +167,22 @@ void timeCalibrate() {
   //Use the clock to determine if the time of day is sunset or sunrise. If so, set appropriate photoresistor threshold to current average.
 }
 
-Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changing,
-    uint32_t photoresistor_avg, bool doublepress_happened, bool doublepress_transition_allowed, uint32_t up_active_loop_count, uint32_t down_active_loop_count) {
+Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changing, uint32_t photoresistor_avg, uint32_t up_active_loop_count, uint32_t down_active_loop_count) {
+  static bool doublepress_transition_allowed = false;
+  static bool doublepress_happened = false;
   Motor_Direction motor_action = Motor_OFF;
   FSM_State next_system_state = curr_system_state;
+
+  if (!up_active && !down_active) {
+    doublepress_transition_allowed = true;
+    doublepress_happened = false;
+    log(3, "Both buttons free\n");
+  }
+  if (up_active && down_active) {
+    doublepress_happened = true;
+    log(3, "Doublepress detected\n");
+  }
+
   switch (curr_system_state) {
     case S_INIT: //State 1
       //There's no logic here, INIT always goes into SETUP_MAX
@@ -193,7 +199,12 @@ Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changin
         break; //While buttons are changing, nothing should be happening
       }
       if (up_active && !down_active && !doublepress_happened) {
-        motor_action = Motor_UP;
+        if (curr_system_state == S_SETUP_MIN && !(shade_not_at_max())) {
+          //No room to go up
+          log(2, "Maximum height -- Cannot go up\n");
+        } else {
+          motor_action = Motor_UP;
+        }
       } else if (!up_active && down_active && !doublepress_happened) {
         motor_action = Motor_DOWN;
       }
@@ -241,9 +252,20 @@ Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changin
         log(3, "Buttons changing, skipping S_WAIT logic\n");
         break;
       }
-      if (up_active && !down_active){
+      if (up_active && down_active) {
+        log(3, "Both buttons pushed (transition allowed? %d)\n", doublepress_transition_allowed);
+        if (up_active_loop_count > LOOPS_UNTIL_DOUBLEPRESS_REGISTERED && down_active_loop_count > LOOPS_UNTIL_DOUBLEPRESS_REGISTERED && doublepress_transition_allowed) {
+          //Double-press in the wait state means we need to go back to setup
+          log(1, "Transitioning from S_WAIT to S_SETUP_MAX due to button double-press\n");
+          doublepress_transition_allowed = false; //To prevent us from immidiatley switching out of the next state right after this transition
+          digitalWrite(SETUP_LED_PIN, HIGH); //turn on LED so that user knows they're back in setup mode
+          next_system_state = S_SETUP_MAX;
+        } else {
+          log(3, "Doublepress detected, waiting for time requirement (pressed for %d / %d loops)\n", min(up_active_loop_count, down_active_loop_count), LOOPS_UNTIL_DOUBLEPRESS_REGISTERED);
+        }        
+      } else if (up_active && !down_active && !doublepress_happened){
         log(2, "Up button pressed\n");
-        if (micros_motor_lowered > MOTOR_MICROS_MARGIN) {
+        if (shade_not_at_max()) {
           //There's still room to go before we hit the top, so all good.
           log(2, "Safety check passed\n");
           log(1, "Transitioning from S_WAIT to S_BUTTON_UP\n");
@@ -252,9 +274,9 @@ Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changin
           log(2, "Shade at maximum height\n");
           next_system_state = S_WAIT;
         }
-      } else if (!up_active && down_active) {
+      } else if (!up_active && down_active && !doublepress_happened) {
         log(2, "Down button pressed\n");
-        if (micros_motor_lowered + MOTOR_MICROS_MARGIN < micros_motor_lowered_max) {
+        if (shade_not_at_min()) {
           //There's still room to go before we hit the bottom, so all good.
           log(2, "Safety check passed\n");
           log(1, "Transitioning from S_WAIT to S_BUTTON_DOWN\n");
@@ -264,21 +286,52 @@ Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changin
           next_system_state = S_WAIT;
         }
       } else {
-        log(3, "No buttons active, staying in S_WAIT\n");
-        next_system_state = S_WAIT;
+        log(3, "No buttons active\n");
+      }
+      //Logic for light-based transitions:
+      if ((millis() - mils_at_last_physical_interaction) / 1000 < PHYSICAL_INTERACTION_LOCKOUT_SECONDS) {
+        //In lockout period, because a physical interaction has happened recently, so do nothing
+        log(3, "Skipping light-based logic due to lockout period. Seconds since interaction: %d\n", (millis() - mils_at_last_physical_interaction) / 1000);
+        break;
+      }
+      //Lockout is no longer a concern if we get here
+      if (!INVERT_SHADE_LIGHT_BEHAVIOR){
+        if (photoresistor_avg > photoresistor_bright_threshold && shade_not_at_max()) {
+          //raise blind when bright
+          log(1, "Transitioning from S_WAIT to S_LIGHT_UP\n");
+          log(2, "photoresistor_avg is: %d\n", photoresistor_avg);
+          next_system_state = S_LIGHT_UP;
+        } else if (photoresistor_avg < photoresistor_dim_threshold && shade_not_at_min()) {
+          //lower blind when dark
+          log(1, "Transitioning from S_WAIT to S_LIGHT_DOWN\n");
+          log(2, "photoresistor_avg is: %d\n", photoresistor_avg);
+          next_system_state = S_LIGHT_DOWN;
+        }
+      } else {
+        if (photoresistor_avg > photoresistor_bright_threshold && shade_not_at_min()) {
+          //lower blind when bright
+          log(1, "Transitioning from S_WAIT to S_LIGHT_DOWN\n");
+          log(2, "photoresistor_avg is: %d\n", photoresistor_avg);
+          next_system_state = S_LIGHT_DOWN;
+        } else if (photoresistor_avg < photoresistor_dim_threshold && shade_not_at_max()) {
+          //raise blind when dark
+          log(1, "Transitioning from S_WAIT to S_LIGHT_UP\n");
+          log(2, "photoresistor_avg is: %d\n", photoresistor_avg);
+          next_system_state = S_LIGHT_UP;
+        }
       }
       break;
     case S_BUTTON_UP:
       if (doublepress_happened || !up_active) {
         //Go back to the wait state (wait state can figure out stuff like double-presses, so no need to duplicate that logic here)
-        log(1, "Transitioning from S_BUTTON_UP to S_WAIT");
+        log(1, "Transitioning from S_BUTTON_UP to S_WAIT\n");
         motor_action = Motor_OFF;
         next_system_state = S_WAIT;
       } else {
         //Check shade position to make sure it's safe to keep going up:
-        if (micros_motor_lowered > MOTOR_MICROS_MARGIN){
+        if (shade_not_at_max()){
           //Remain in the S_BUTTON_UP state, and command the motor to go up
-          log(2, "Staying in S_BUTTON_UP");
+          log(3, "Staying in S_BUTTON_UP\n");
           motor_action = Motor_UP;
           next_system_state = S_BUTTON_UP; //Probably redundant, but whatever it doesn't hurt
         } else {
@@ -293,18 +346,18 @@ Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changin
       //Basically the same as S_BUTTON_UP
       if (doublepress_happened || !down_active) {
         //Go back to the wait state (wait state can figure out stuff like double-presses, so no need to duplicate that logic here)
-        log(1, "Transitioning from S_BUTTON_DOWN to S_WAIT");
+        log(1, "Transitioning from S_BUTTON_DOWN to S_WAIT\n");
         motor_action = Motor_OFF;
         next_system_state = S_WAIT;
       } else {
         //Check shade position to make sure it's safe to keep going down:
-        if (micros_motor_lowered + MOTOR_MICROS_MARGIN < micros_motor_lowered_max){
+        if (shade_not_at_min()){
           //Remain in the S_BUTTON_DOWN state, and command the motor to go down
-          log(2, "Staying in S_BUTTON_DOWN");
+          log(3, "Staying in S_BUTTON_DOWN\n");
           motor_action = Motor_DOWN;
           next_system_state = S_BUTTON_DOWN; //Probably redundant, but whatever it doesn't hurt
         } else {
-          log(1, "Shade at maximum height, transitioning from S_BUTTON_DOWN to S_WAIT\n");
+          log(1, "Shade at minimum height, transitioning from S_BUTTON_DOWN to S_WAIT\n");
           log(2, "micros_motor_lowered: %d | threshold (micros_motor_lowered_max): %d\n", micros_motor_lowered, micros_motor_lowered_max);
           motor_action = Motor_OFF;
           next_system_state = S_WAIT;
@@ -312,18 +365,50 @@ Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changin
       }
       break;
     case S_LIGHT_UP:
-      break;
     case S_LIGHT_DOWN:
+      if (up_active || down_active){
+        //Physical input overrides anything, go back to waiting
+        log(1, "Transitioning from S_LIGHT_(UP/DOWN) to S_WAIT due to user input\n");
+        motor_action = Motor_OFF;
+        next_system_state = S_WAIT;
+      } else {
+        //Check if the shade is at the max/min
+        if (curr_system_state == S_LIGHT_UP){
+          if (shade_not_at_max()) {
+            //All good, there's still room to raise
+            log(3, "Staying in S_LIGHT_UP, there's still room to raise\n");
+            motor_action = Motor_UP;
+            next_system_state = S_LIGHT_UP;
+          } else {
+            log(1, "Transitioning from S_LIGHT_UP to S_WAIT due to blind reaching limit\n");
+            motor_action = Motor_OFF;
+            next_system_state = S_WAIT;
+          }
+        } else {
+          if (shade_not_at_min()) {
+            //All good, there's still room to lower
+            log(3, "Staying in S_LIGHT_DOWN, there's still room to lower\n");
+            motor_action = Motor_DOWN;
+            next_system_state = S_LIGHT_DOWN;
+          } else {
+            log(1, "Transitioning from S_LIGHT_DOWN to S_WAIT due to blind reaching limit\n");
+            motor_action = Motor_OFF;
+            next_system_state = S_WAIT;
+          }
+        }
+      }
       break;
     case S_UNRECOVERABLE_ERROR:
       //For cases where the device was setup wrong, or otherwise needs to be power cycled
       //Just blink the LED and disable the device by going into an infinite loop
+      log(0, "ERROR: Unrecoverable Error State Reached\n");
       setMotor(Motor_OFF); //Make sure motor is not still running
       errorLoop();
       break;
     default:
       log(0, "ERROR: Unrecognized State of: %d\n", curr_system_state);
   };
+  log(3, "Setting state from: %d to: %d\n", curr_system_state, next_system_state);
   curr_system_state = next_system_state;
   return motor_action;
 }
@@ -367,9 +452,11 @@ void setMotor(Motor_Direction direction){
   static bool tracking_movement = false;
   static uint32_t micros_at_movement;
   static Motor_Direction last_motor_command = Motor_OFF;
+  static uint32_t motor_cycle_counter = 0; //Used only for printing stuff nicely, can be ignored.
+  motor_cycle_counter++;
   if (last_motor_command == Motor_OFF && direction != Motor_OFF){
     //Motor just changed from off into some other state, log it with less verbosity required
-    log(1, "Motor Recieved New Command: %d\n", direction);
+    log(2, "Motor Recieved New Command: %d\n", direction);
     //set micros_at_movement_start
   } else {
     log(3, "Motor Command Recieved: %d\n", direction);
@@ -383,11 +470,11 @@ void setMotor(Motor_Direction direction){
     direction = Motor_ERR; //Make sure it's not a defined direction, so that we go into the error case 
   }
   if (tracking_movement) {
-    log(2, "Moving in direction %d, calculating offset change\n", last_motor_command);
+    log(3, "Moving in direction %d, calculating offset change\n", last_motor_command);
     uint32_t time_now = micros();
     uint32_t motor_on_time = time_now - micros_at_movement;
     //TODO: Handle overflow of micros(), which happens every hour-ish
-    log(2, "Calculated that this movement step has been ocurring for %d micros\n", motor_on_time);
+    log(3, "Calculated that this movement step has been ocurring for %d micros\n", motor_on_time);
     if (abs((int)last_motor_command) != 1) {
       log(0, "ERROR: last_motor_command was not a direction, so cannot calculate motor offset | Unrecoverable Error\n");
       tracking_movement = false;
@@ -395,8 +482,11 @@ void setMotor(Motor_Direction direction){
     }
     //Now we can assume that last_motor_command is either -1 or 1, so we can do math! (-1 is down, 1 is up)
     int motor_offset = motor_on_time * -1 * (int)last_motor_command; //If commmand was up, then offset will be negative. (otherwise unchanged)
-    log(2, "Applying offset of %d | old micros_motor_lowered: %d | new micros_motor_lowered: %d\n",motor_offset, micros_motor_lowered, micros_motor_lowered + motor_offset);
+    log(3, "Applying offset of %d | old micros_motor_lowered: %d | new micros_motor_lowered: %d\n",motor_offset, micros_motor_lowered, micros_motor_lowered + motor_offset);
     micros_motor_lowered += motor_offset;
+    if (motor_cycle_counter % 100 == 0) {
+      log(2, "Motor Update | micros_motor_lowered = %d\n", micros_motor_lowered);
+    }
   }
   switch (direction) {
     case Motor_UP:
