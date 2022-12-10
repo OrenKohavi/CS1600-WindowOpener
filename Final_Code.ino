@@ -13,7 +13,7 @@ Recalibrate the thresholds for
 */
 
 //For demo/debugging
-#define DEMO_MODE false
+#define DEMO_MODE
 #define VERBOSE 2 //Higher number is more verbose. Ranges from [0-3], with 0 being only errors shown, and 3 being insane amounts of output.
 
 //For integration and adjustments
@@ -29,12 +29,21 @@ Recalibrate the thresholds for
 #define SETUP_LED_PIN 14
 
 //For changing fundamental system behavior
+#ifdef DEMO_MODE
+//Special definitions so that the product can be demo'ed easily
+#define MINS_PER_SAMPLE_INTERVAL 1
+#define PHYSICAL_INTERACTION_LOCKOUT_SECONDS 30
+#else
+//Normal operation
+#define MINS_PER_SAMPLE_INTERVAL 5 //How long do we record data for our moving average
+#define PHYSICAL_INTERACTION_LOCKOUT_SECONDS 60 * 60 //One hour
+#endif
+
 #define USE_WATCHDOG false
 #define LOOP_INTERVAL 5 //ms delay between loops
-#define MINS_PER_SAMPLE_INTERVAL 5 //How long do we record data for our moving average
 #define MS_UNTIL_DOUBLEPRESS_REGISTERED 1500
 #define PHOTORESISTOR_SAMPLE_INTERVAL_MS 100 //ms between light sensor samples
-#define MS_UNTIL_BUTTON_PRESS_REGISTERED 50
+#define MS_UNTIL_BUTTON_PRESS_REGISTERED 60
 #define LOOPS_UNTIL_DOUBLEPRESS_REGISTERED (((MS_UNTIL_DOUBLEPRESS_REGISTERED - LOOP_INTERVAL) / LOOP_INTERVAL) + 1)
 #define LOOPS_UNTIL_BUTTON_PRESS_REGISTERED (((MS_UNTIL_BUTTON_PRESS_REGISTERED - LOOP_INTERVAL) / LOOP_INTERVAL) + 1)
 #define LOOPS_PER_PHOTORESISTOR_SAMPLE (PHOTORESISTOR_SAMPLE_INTERVAL_MS / LOOP_INTERVAL)
@@ -115,8 +124,6 @@ void loop() {
   //Static Stuff
   static uint32_t up_active_loop_count = 0;
   static uint32_t down_active_loop_count = 0;
-  static uint32_t loops_since_last_photoresistor_reading = UINT32_MAX; //set to INT_MAX at first, so that it always takes a photoresistor reading on the first loop
-  static uint32_t photoresistor_avg;
   static bool doublepress_happened; //gets set to true when a doublepress occurrs, and should prevent motor movement if true.
   static bool doublepress_transition_allowed; //Set to false when a doublepress triggers a transition, and is only reset to true when no buttons are being clicked.
 
@@ -129,9 +136,8 @@ void loop() {
   bool down_active = down_active_loop_count >= LOOPS_UNTIL_BUTTON_PRESS_REGISTERED;
   bool buttons_changing = (!up_active && up_active_loop_count > 0) || (!down_active && down_active_loop_count > 0);
   Motor_Direction motor_action = Motor_OFF;
-
   log(3, "Up active loop count: %d | down_active_loop_count: %d\n", up_active_loop_count, down_active_loop_count);
-  
+  //Set some variables based on which buttons are up/down
   if (!up_active && !down_active) {
     doublepress_transition_allowed = true;
     doublepress_happened = false;
@@ -142,43 +148,34 @@ void loop() {
     log(3, "Doublepress detected\n");
   }
 
-  //Get reading from photoresistor, and calculate moving average
-  if (loops_since_last_photoresistor_reading >= LOOPS_PER_PHOTORESISTOR_SAMPLE) {
-    //Time to take a new sample (otherwise, just skip it and leave all variables unchanged)
-    loops_since_last_photoresistor_reading = 0;
-    uint16_t new_sample = analogRead(PHOTORESISTOR_PIN);
-    sample_arr[sample_arr_idx] = new_sample;
-    log(3, "New photoresistor sample is: %d | placed into sample_arr[%d] -- ", new_sample, sample_arr_idx);
-    sample_arr_idx++; //increment circular buffer pointer
-    sample_arr_idx = sample_arr_idx % SAMPLES_TO_KEEP;
-    //Now calculate the average reading over the whole array (uninitialized values are 0xFFFF, which is not a valid photoresistor reading)
-    uint32_t valid_samples = 0;
-    uint32_t ignored_samples = 0;
-    uint32_t sample_sum = 0; //accumulator variable (Will not overflow unless we have 2^16 samples, which memory can't even hold.)
-    for (int i = 0; i < SAMPLES_TO_KEEP; i++) {
-      uint16_t this_sample = sample_arr[i];
-      if (this_sample == UINT16_MAX){
-        ignored_samples++;
-        continue;
-      } else {
-        valid_samples++;
-        sample_sum += this_sample;
-      }
-    }
-    photoresistor_avg = sample_sum / valid_samples;
-    log(3, "Finished finding average of photoresistor readings. photoresistor_avg: %d | valid_samples: %d | ignored_samples: %d\n", photoresistor_avg, valid_samples, ignored_samples);
-  } else {
-    loops_since_last_photoresistor_reading++;
-    log(3, "Not taking photoresistor sample. loops_since_last_photoresistor_reading: %d | photoresistor_avg: %d\n", loops_since_last_photoresistor_reading, photoresistor_avg);
+  uint32_t photoresistor_avg = readPhotoresistor();
+
+  //Time-calibration logic.
+  if (CALIBRATE_AT_SUNRISE_SUNSET) {
+    timeCalibrate();
   }
 
-  //Time-calibration logic. 
-
-  //FSM Logic
-  motor_action = Motor_OFF;
-  log(3, "Entering FSM... Current State: %d | up_active: %d | down_active: %d | buttons_changing: %d | photoresistor_avg: %d | micros_motor_lowered: %d | max_lower: %d\n",
+  log(3, "Before FSM, Current State: %d | up_active: %d | down_active: %d | buttons_changing: %d | photoresistor_avg: %d | micros_motor_lowered: %d | max_lower: %d\n",
     curr_system_state, up_active, down_active, buttons_changing, photoresistor_avg, micros_motor_lowered, micros_motor_lowered_max);
+  motor_action = fsmUpdate(up_active, down_active, buttons_changing, photoresistor_avg, doublepress_happened, doublepress_transition_allowed, up_active_loop_count, down_active_loop_count);
+  log(3, "After FSM, state is: %d\n", curr_system_state);
+  setMotor(motor_action);
 
+  //End of the loop -- Reset the Watchdog and delay
+  if (USE_WATCHDOG) {
+    Watchdog.reset();
+  }
+  delay(LOOP_INTERVAL);
+  log(3, "---- LOOP END ----\n");
+}
+
+void timeCalibrate() {
+  //Use the clock to determine if the time of day is sunset or sunrise. If so, set appropriate photoresistor threshold to current average.
+}
+
+Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changing,
+    uint32_t photoresistor_avg, bool doublepress_happened, bool doublepress_transition_allowed, uint32_t up_active_loop_count, uint32_t down_active_loop_count) {
+  Motor_Direction motor_action = Motor_OFF;
   FSM_State next_system_state = curr_system_state;
   switch (curr_system_state) {
     case S_INIT: //State 1
@@ -322,21 +319,48 @@ void loop() {
       //For cases where the device was setup wrong, or otherwise needs to be power cycled
       //Just blink the LED and disable the device by going into an infinite loop
       setMotor(Motor_OFF); //Make sure motor is not still running
-      error_loop();
+      errorLoop();
       break;
     default:
       log(0, "ERROR: Unrecognized State of: %d\n", curr_system_state);
   };
   curr_system_state = next_system_state;
-  log(3, "After FSM, state is: %d\n", curr_system_state);
+  return motor_action;
+}
 
-  //End of the loop -- Reset the Watchdog and apply motor action.
-  setMotor(motor_action);
-  if (USE_WATCHDOG) {
-    Watchdog.reset();
+int readPhotoresistor() {
+  static uint32_t loops_since_last_photoresistor_reading = UINT32_MAX; //set to INT_MAX at first, so that it always takes a photoresistor reading on the first loop
+  static uint32_t photoresistor_avg;
+  //Get reading from photoresistor, and calculate moving average
+  if (loops_since_last_photoresistor_reading >= LOOPS_PER_PHOTORESISTOR_SAMPLE) {
+    //Time to take a new sample (otherwise, just skip it and leave all variables unchanged)
+    loops_since_last_photoresistor_reading = 0;
+    uint16_t new_sample = analogRead(PHOTORESISTOR_PIN);
+    sample_arr[sample_arr_idx] = new_sample;
+    log(3, "New photoresistor sample is: %d | placed into sample_arr[%d] -- ", new_sample, sample_arr_idx);
+    sample_arr_idx++; //increment circular buffer pointer
+    sample_arr_idx = sample_arr_idx % SAMPLES_TO_KEEP;
+    //Now calculate the average reading over the whole array (uninitialized values are 0xFFFF, which is not a valid photoresistor reading)
+    uint32_t valid_samples = 0;
+    uint32_t ignored_samples = 0;
+    uint32_t sample_sum = 0; //accumulator variable (Will not overflow unless we have 2^16 samples, which memory can't even hold.)
+    for (int i = 0; i < SAMPLES_TO_KEEP; i++) {
+      uint16_t this_sample = sample_arr[i];
+      if (this_sample == UINT16_MAX){
+        ignored_samples++;
+        continue;
+      } else {
+        valid_samples++;
+        sample_sum += this_sample;
+      }
+    }
+    photoresistor_avg = sample_sum / valid_samples;
+    log(3, "Finished finding average of photoresistor readings. photoresistor_avg: %d | valid_samples: %d | ignored_samples: %d\n", photoresistor_avg, valid_samples, ignored_samples);
+  } else {
+    loops_since_last_photoresistor_reading++;
+    log(3, "Not taking photoresistor sample. loops_since_last_photoresistor_reading: %d | photoresistor_avg: %d\n", loops_since_last_photoresistor_reading, photoresistor_avg);
   }
-  delay(LOOP_INTERVAL);
-  log(3, "---- LOOP END ----\n");
+  return photoresistor_avg;
 }
 
 void setMotor(Motor_Direction direction){
@@ -411,7 +435,7 @@ void setMotor(Motor_Direction direction){
         digitalWrite(MOTOR_PIN_2, LOW);
       }
       curr_system_state = S_UNRECOVERABLE_ERROR;
-      error_loop();
+      errorLoop();
       break;
   };
   last_motor_command = direction;

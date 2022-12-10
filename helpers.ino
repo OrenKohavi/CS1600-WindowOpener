@@ -34,7 +34,7 @@ void led_quick_flash() {
   delay(100);
 }
 
-void error_loop() {
+void errorLoop() {
   while(true) {
     digitalWrite(SETUP_LED_PIN, LOW);
     delay(250);
