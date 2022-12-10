@@ -3,21 +3,24 @@
 /*
 TODO:
 FSM Implementation
-Buttons_Changing 
+Demo_mode definitions
 Timer for motor sanity check
-Automatic threshold recalibration
+Automatic threshold recalibration (Use WiFi and real-world time)
 */
 
-#define DEMO_MODE
+/*
+Use wifi to get the real world time, and get sunrise/sunset times
+Recalibrate the thresholds for 
+*/
 
-//User-configurable actions
-#define USE_TIMEBASED_ACTIONS false
-#define USE_LIGHTBASED_ACTIONS true
+//For demo/debugging
+#define DEMO_MODE false
+#define VERBOSE true
 
 //For integration and adjustments
 #define INVERT_MOTOR_OFF_STATE false
 #define INITIAL_LOW_LIGHT_THRESHOLD 50
-#define INITIAL_HIGH_LIGHT_THRESHOLD 800
+#define INITIAL_HIGH_LIGHT_THRESHOLD 500
 #define INVERT_MOTOR_DIR false
 #define UP_PIN 1
 #define DOWN_PIN 0
@@ -26,18 +29,15 @@ Automatic threshold recalibration
 #define PHOTORESISTOR_PIN A6
 
 //For changing fundamental system behavior
-#define LOOP_INTERVAL 5 //ms delay between loops -- DO NOT SET LOWER THAN 4MS (so that LOOPS_UNTIL_DOUBLEPRESS_REGISTERED < 255)
-#define MS_UNTIL_DOUBLEPRESS_REGISTERED 1000 //DO NOT SET ABOVE 1000 UNLESS LOOP_INTERVAL IS >=10 (so that LOOPS_UNTIL_DOUBLEPRESS_REGISTERED < 255)
+#define LOOP_INTERVAL 5 //ms delay between loops
+#define MS_UNTIL_DOUBLEPRESS_REGISTERED 1000
 #define LOOPS_UNTIL_DOUBLEPRESS_REGISTERED MS_UNTIL_DOUBLEPRESS_REGISTERED / LOOP_INTERVAL
 #define PHOTORESISTOR_SAMPLE_INTERVAL_MS 100 //ms between light sensor samples
 #define MS_UNTIL_BUTTON_PRESS_REGISTERED 50
 #define LOOPS_UNTIL_BUTTON_PRESS_REGISTERED MS_UNTIL_BUTTON_PRESS_REGISTERED / LOOP_INTERVAL
 #define LOOPS_PER_PHOTORESISTOR_SAMPLE PHOTORESISTOR_SAMPLE_INTERVAL_MS / LOOP_INTERVAL
-#define MINS_PER_SAMPLE_INTERVAL 5 //How long before we discard historical data
+#define MINS_PER_SAMPLE_INTERVAL 5 //How long do we record data for our moving average
 #define SAMPLES_TO_KEEP (1000 * 60 * MINS_PER_SAMPLE_INTERVAL) / PHOTORESISTOR_SAMPLE_INTERVAL_MS //How many ints do we need to store
-#define SUPERSAMPLES_TO_KEEP (60 * 6) / MINS_PER_SAMPLE_INTERVAL //How many sample interval averages should we store (6hrs of historical data)
-#define BUTTON_HISTORY_ARR_SIZE 255 //DON'T CHANGE - How far back should we store the state of the buttons (for detecting double-presses and such)
-//BUTTON_HISTORY_ARR_SIZE *must* stay at 255 (or higher, I guess) unless you know what you're doing, as the circular buffer relies on unsigned integer overflow/underflow (which is defined behavior)
 
 enum FSM_State {
   S_INIT,
@@ -46,7 +46,6 @@ enum FSM_State {
   S_WAITING,
   S_MOTOR_MOVING_UP,
   S_MOTOR_MOVING_DOWN,
-  S_MOVEMENT_DEFERRED_BY_MANUAL_PRESS, //Safety thing, don't want automatic movements while manual movements are happening
 };
 
 enum Motor_Direction {
@@ -57,23 +56,16 @@ enum Motor_Direction {
 
 //Globals
 FSM_State curr_system_state = S_INIT;
-int16_t sample_arr[SAMPLES_TO_KEEP]; //These arrays use about 6KB (20%) of SRAM, but we have 32KB so it's no problem
-int16_t supersample_arr[SUPERSAMPLES_TO_KEEP];
+int16_t sample_arr[SAMPLES_TO_KEEP];
 size_t sample_arr_idx = 0;
-size_t supersample_arr_idx = 0;
-uint32_t mils_at_last_time_update;
 uint32_t mils_at_last_physical_interaction;
 uint32_t micros_at_motor_start;
 uint32_t micros_at_motor_end;
 uint32_t micros_motor_raised; //counts the number of microseconds that the motor has been lifting (i.e. this tracks how far above the bottom we are)
 int up_button_state;
 int down_button_state;
-uint8_t button_history_arr[BUTTON_HISTORY_ARR_SIZE + 16]; //Circular buffer for storing historical button press data and recognizing when both buttons are pushed
-//16 bytes longer than it needs to be, because there's REALLY STRANGE memory issues here, so this is just padding.
-uint8_t button_history_arr_idx = 0;
-Motor_Direction last_motor_command;
+Motor_Direction last_motor_command = Motor_OFF;
 uint32_t last_motor_command_time;
-bool should_print = true;
 
 void setup() {
   Serial.begin(9600);
@@ -90,14 +82,8 @@ void setup() {
     Serial.print("SAMPLES_TO_KEEP: ");
     Serial.println(SAMPLES_TO_KEEP, DEC);
 
-    Serial.print("SUPERSAMPLES_TO_KEEP: ");
-    Serial.println(SUPERSAMPLES_TO_KEEP, DEC); 
-
     Serial.print("LOOPS_PER_PHOTORESISTOR_SAMPLE: ");
     Serial.println(LOOPS_PER_PHOTORESISTOR_SAMPLE, DEC);
-
-    Serial.print("BUTTON_HISTORY_ARR_SIZE: ");
-    Serial.println(BUTTON_HISTORY_ARR_SIZE, DEC);
   }
 
   //Initialize all pins with correct pinmodes
@@ -109,85 +95,56 @@ void setup() {
 
   //Clear arrays for samples and supersamples
   memset(sample_arr, -1, sizeof(int16_t) * SAMPLES_TO_KEEP);
-  memset(supersample_arr, -1, sizeof(int16_t) * SUPERSAMPLES_TO_KEEP);
-  //Clear history array
-  memset(button_history_arr, 0x0, BUTTON_HISTORY_ARR_SIZE);
 
   //Setup button interrupts
   //Due to details in the interrupt handler, these cannot be different functions (Since both pins may be on the same pin bank)
   attachInterrupt(digitalPinToInterrupt(UP_PIN), Button_ISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(DOWN_PIN), Button_ISR, CHANGE);
 
-  if (USE_TIMEBASED_ACTIONS) {
-    //Connect to WiFi and sync time
-    //TODO
-    mils_at_last_time_update = millis();
-  }
+  //Connect to WiFi and sync time
+  //TODO
 
   //Enable watchdog (So that things like WiFi connection don't cause the WDT to accidentaly trigger)
-  //int watchdog_time = Watchdog.enable(1000); //ms before watchdog kicks
-  int watchdog_time = -1;
+  int watchdog_time = Watchdog.enable(LOOP_INTERVAL * 2); //ms before watchdog kicks
+  //int watchdog_time = -1;
   Serial.print("Enabled the watchdog with a time of: ");
   Serial.print(watchdog_time, DEC);
   Serial.println();
 }
 
 void loop() {
-  Motor_Direction motor_action = Motor_OFF;
-  bool direction_manually_modified = false;
+  //Static Stuff
+  static Motor_Direction motor_action = Motor_OFF;
+  static uint32_t up_active_loop_count = 0;
+  static uint32_t down_active_loop_count = 0;
+  static bool should_print = true; //helps for printing button presses in verbose mode
 
-  uint8_t history = 0x0;
+  //Count loops active for each button
+  up_active_loop_count++;
+  up_active_loop_count *= (up_button_state == HIGH); //Resets to zero if button is not pressed
+  down_active_loop_count++;
+  down_active_loop_count *= (up_button_state == HIGH); //Resets to zero if button is not pressed
+  bool up_active = up_active_loop_count >= LOOPS_UNTIL_BUTTON_PRESS_REGISTERED;
+  bool down_active = down_active_loop_count >= LOOPS_UNTIL_BUTTON_PRESS_REGISTERED;
+  bool buttons_changing = (up_active_loop_count < LOOPS_UNTIL_BUTTON_PRESS_REGISTERED || down_active_loop_count < LOOPS_UNTIL_BUTTON_PRESS_REGISTERED);
+
+  //FSM Logic
+  if (VERBOSE) {
+    Serial.print("Entering FSM Logic with state: ");
+    Serial.println(curr_system_state);
+  }
+
+
   /*
-  history is a bitfield
-  [0:5] -> Unmapped/Reserved
-  [6] -> down_button pressed in current state
-  [7] -> up_button pressed in current state
-  */
-  if (up_button_state == HIGH) {
-    history |= 0b00000001;
-  }
-  if (down_button_state == HIGH) {
-    history |= 0b00000010;
-  }
-
-  button_history_arr[button_history_arr_idx] = history;
-
-  //Check the history to determine button behavior
-  uint8_t active_buttons = 0b00000011;
-  uint8_t loop_limit = button_history_arr_idx - LOOPS_UNTIL_BUTTON_PRESS_REGISTERED;
-  //Serial.print("Before Loop: idx=");
-  //Serial.println(button_history_arr_idx, DEC); 
-  for (uint8_t i = button_history_arr_idx; i != loop_limit; i--){
-    int curr_data = button_history_arr[i];
-    active_buttons &= curr_data;
-    /*
-    Serial.print("Inloop, i / idx / limit = ");
-    Serial.print(i, DEC);
-    Serial.print(" | ");
-    Serial.print(button_history_arr_idx, DEC);
-    Serial.print(" | ");
-    Serial.println(loop_limit, DEC);
-    */
-  }
-  bool up_active = active_buttons & 0b00000001;
-  bool down_active = (active_buttons & 0b00000010) >> 1;
-  bool buttons_changing = active_buttons != (history & 0b00000011); //if buttons are in the process of being pressed, buttons_changing should be true.
-  //Serial.print("After Loop: idx=");
-  //Serial.println(button_history_arr_idx, DEC);  
-  if (!buttons_changing) { //We only want to take actions after buttons have stabilized
+  if (buttons_changing) { //We only want to take actions after buttons have stabilized
+    Serial.println("Buttons Changing -- Taking no action");
+  } else {
     if (up_active && down_active) {
       if (should_print) {
         Serial.println("Both Buttons Clicked!");
         should_print = false;
       }
-      //Do a deeper dive into the history to see if both buttons have been pressed for at least 
-      active_buttons = 0b00000011; //reset active_buttons
-      loop_limit = button_history_arr_idx - LOOPS_UNTIL_DOUBLEPRESS_REGISTERED;
-      for (uint8_t i = button_history_arr_idx; i != loop_limit; i--){
-        uint8_t curr_data = button_history_arr[i];
-        active_buttons &= curr_data;
-      }
-      if (active_buttons == 0b00000011) {
+      if (up_active_loop_count > LOOPS_UNTIL_DOUBLEPRESS_REGISTERED && down_active_loop_count > LOOPS_UNTIL_BUTTON_PRESS_REGISTERED) {
         //Both buttons have been pressed long enough to trigger setup mode
         //Enter setup mode
         Serial.println("Entering Setup Mode!");
@@ -210,47 +167,11 @@ void loop() {
       //No need to set motor_action, because default is off.
       should_print = true;
     }
-  } else {
-    Serial.println("Buttons Changing");
-    /*
-    Serial.print("Buttons Changing -- active_buttons / history / idx is: ");
-    Serial.print(active_buttons, BIN);
-    Serial.print(" | ");
-    Serial.print(history, BIN);
-    Serial.print(" | ");
-    Serial.print(button_history_arr_idx, DEC);
-    Serial.print(" | ");
-    Serial.print((uint8_t)(button_history_arr_idx - (uint8_t)LOOPS_UNTIL_DOUBLEPRESS_REGISTERED), DEC);
-    Serial.println();
-    */
-
-    //setMotor(Motor_OFF) //Motor should be off when buttons are changing
   }
-
-
-  //Automatic actions should really be handled by the FSM system - Otherwise there's way too much interaction to deal with manually
-  if (direction_manually_modified){
-    //Skip the photoresistor crap, because manual input overrides it
-    //Serial.println("Skipping Photoresistor checks");
-  } else {
-    int16_t photoresistor_reading = analogRead(PHOTORESISTOR_PIN);
-    //Serial.print("Photoresistor Reading: ");
-    //Serial.println(photoresistor_reading, DEC);
-    if (photoresistor_reading > INITIAL_HIGH_LIGHT_THRESHOLD){
-      motor_action = Motor_UP;
-    } else if (photoresistor_reading < INITIAL_LOW_LIGHT_THRESHOLD) {
-      motor_action = Motor_DOWN;
-    }
-  }
-
-  //Watchdog.reset();
-  //Serial.println("--Loop--");
-  if (button_history_arr_idx == 0){
-    Serial.println("Heartbeat");
-  }
+  */
 
   setMotor(motor_action);
-  button_history_arr_idx++;
+  Watchdog.reset();
   delay(LOOP_INTERVAL);
 }
 
