@@ -1,4 +1,5 @@
 #include <Adafruit_SleepyDog.h>
+#include <time.h>
 
 //For demo/debugging
 #define DEMO_MODE
@@ -6,6 +7,8 @@
 
 //For integration and adjustments
 #define CALIBRATE_AT_SUNRISE_SUNSET true
+#define HOURS_AFTER_SUNSET_CALIBRATION 2
+#define HOURS_BEFORE_SUNRISE_CALIBRATION 0
 #define INVERT_MOTOR_OFF_STATE true
 #define INITIAL_LOW_LIGHT_THRESHOLD 50
 #define INITIAL_HIGH_LIGHT_THRESHOLD 500
@@ -32,6 +35,7 @@
 
 #define SUNRISE_LAT 41.82 //Lat and Long of Providence, RI
 #define SUNRISE_LON -71.41 //Doesn't have to be perfectly precise, because it's just the sunrise/sunset time: It can vary by a few mins without issue.
+#define TIMEZONE_OFFSET 7
 #define INVERT_SHADE_LIGHT_BEHAVIOR false //when false, shades will raise when bright, and lower when dim. When true, shades will lower when bright, and raise when dim.
 #define USE_WATCHDOG true
 #define LOOP_INTERVAL 5 //ms delay between loops (At 2ms and below, behavior starts getting funky)
@@ -77,10 +81,11 @@ int32_t micros_motor_lowered_max; //Maximum micros of height the motor can be at
 PinStatus up_button_state;
 PinStatus down_button_state;
 bool use_wifi = CALIBRATE_AT_SUNRISE_SUNSET;
-uint32_t unix_epoch_time;
-//sunrise time
-//sunset time
-//current time
+time_t unix_epoch_time_at_startup;
+uint32_t mils_at_startup;
+tm sunset_time;
+tm sunrise_time;
+tm current_time;
 
 void setup() {
   Serial.begin(9600);
@@ -122,6 +127,8 @@ void setup() {
   //Now get the current time
   if(use_wifi && get_current_time()) {
     log(1, "Current Time Fetched\n");
+    //Adjust for timezone
+    unix_epoch_time_at_startup += (TIMEZONE_OFFSET * 60 * 60);
   } else {
     log(0, "ERROR: Could not fetch current time\n");
     use_wifi = false;
@@ -134,7 +141,15 @@ void setup() {
     use_wifi = false;
   }
 
-  //Enable watchdog (So that things like WiFi connection don't cause the WDT to accidentaly trigger)
+  if (use_wifi) {
+    log(1, "Wifi Setup Succeeded!\n");
+    log(2, "Sunrise is at: %d:%d\n", sunrise_time.tm_hour, sunrise_time.tm_min);
+    log(2, "Sunset is at: %d:%d\n", sunset_time.tm_hour, sunset_time.tm_min);
+    current_time = *localtime(&unix_epoch_time_at_startup);
+    log(2, "Time at startup is: %d:%d\n", current_time.tm_hour, current_time.tm_min);
+  }
+
+  //Enable watchdog (at the end of setup so that things like WiFi connection don't cause the WDT to accidentaly trigger)
   if (USE_WATCHDOG) {
     int watchdog_time = Watchdog.enable(max(1000, LOOP_INTERVAL * 4));
     log(1, "Enabled WDT with period of %d\n", watchdog_time);
@@ -159,13 +174,18 @@ void loop() {
   bool buttons_changing = (!up_active && up_active_loop_count > 0) || (!down_active && down_active_loop_count > 0);
   Motor_Direction motor_action = Motor_OFF;
   log(3, "Up active loop count: %d | down_active_loop_count: %d\n", up_active_loop_count, down_active_loop_count);
-  //Set some variables based on which buttons are up/down
+  if (up_active_loop_count > 0 || down_active_loop_count > 0) {
+    //This is already done in the ISR, but this case also deals with long button presses (where the ISR only triggers on a button change)
+    mils_at_last_physical_interaction = millis();
+  }
 
   uint32_t photoresistor_avg = readPhotoresistor();
 
   //Time-calibration logic.
+  time_t epoch_time_now = unix_epoch_time_at_startup + ((millis() - mils_at_startup) / 1000);
+  current_time = *localtime(&epoch_time_now); //This is outside the timeCalibrate function because it's used for timestamps on printouts
   if (use_wifi) {
-    timeCalibrate();
+    timeCalibrate(current_time, photoresistor_avg);
   }
 
   log(3, "Before FSM, Current State: %d | up_active: %d | down_active: %d | buttons_changing: %d | photoresistor_avg: %d | micros_motor_lowered: %d | max_lower: %d\n",
@@ -180,14 +200,21 @@ void loop() {
     log(3, "Reset Watchdog\n");
   }
   if (loop_counter % 200 == 0 && true) {
-    log(1, "photoresistor avg: %d | time since last physical interaction: %d\n", photoresistor_avg, (millis() - mils_at_last_physical_interaction) / 1000);
+    log(1, "[%d:%d] photoresistor avg: %d | time since last physical interaction: %d\n", current_time.tm_hour, current_time.tm_min, photoresistor_avg, (millis() - mils_at_last_physical_interaction) / 1000);
   }
   delay(LOOP_INTERVAL);
   log(3, "---- LOOP END ----\n");
 }
 
-void timeCalibrate() {
+void timeCalibrate(tm current_time, uint32_t photoresistor_avg) {
   //Use the clock to determine if the time of day is sunset or sunrise. If so, set appropriate photoresistor threshold to current average.
+  if (same_hour_minute(current_time, sunrise_time)) {
+    //Reset thresholds for bright light
+    photoresistor_bright_threshold = photoresistor_avg;
+  } else if (same_hour_minute(current_time, sunset_time)) {
+    //Reset thresholds for low light
+    photoresistor_dim_threshold = photoresistor_avg;
+  }
 }
 
 Motor_Direction fsmUpdate(bool up_active, bool down_active, bool buttons_changing, uint32_t photoresistor_avg, uint32_t up_active_loop_count, uint32_t down_active_loop_count) {

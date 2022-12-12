@@ -142,7 +142,8 @@ bool get_current_time() {
         Serial.println(epoch % 60); // print the second
       }
       //Set global variable
-      unix_epoch_time = epoch;
+      unix_epoch_time_at_startup = epoch;
+      mils_at_startup = millis();
       return true;
     } else {
       log(2, "No UDP Packet recieved in time on attempt %d\n", attempts);
@@ -186,10 +187,15 @@ bool get_sunrise_sunset_times() {
 }
 
 bool parse_sun_times(String json) {
-  StaticJsonDocument<200> doc;
+  StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, json);
+  if (VERBOSE >= 2) {
+    Serial.print("JSON is: ");
+    Serial.println(json);
+  }
   if (error) {
     log(1, "Failed to parse JSON for sun times\n");
+    log(1, "Error was: %s\n", error.c_str());
     return false;
   }
   const char* status = doc["status"];
@@ -200,7 +206,40 @@ bool parse_sun_times(String json) {
     return false;
   }
 
+  String sunrise_str = doc["results"]["sunrise"];
+  String sunset_str = doc["results"]["sunset"];
+
+  API_string_to_tm(sunrise_str, &sunrise_time);
+  API_string_to_tm(sunset_str, &sunset_time);
+
+  if (VERBOSE >= 2) {
+    Serial.print("sunrise is at: ");
+    Serial.println(sunrise_str);
+    Serial.print("Sunset is at: ");
+    Serial.println(sunset_str);
+  }
+
   return true;
+}
+
+void API_string_to_tm(String s, tm* result) {
+  //Format HH:MM:SS AM/PM
+  bool is_pm = s.charAt(s.length()-2) == 'P'; //Subtract 1 to get past the 'M', and 1 for 0-based indexing (Which is why we subtract -2 in the charAt method)
+  int first_colon_idx = s.indexOf(':');
+  int hours = atoi(s.substring(0, first_colon_idx).c_str());
+  if (is_pm) {
+    hours += 12;
+  }
+  if (hours == 24) {
+    hours = 0;
+  }
+  int minutes = atoi(s.substring(first_colon_idx+1, first_colon_idx+3).c_str());
+  result->tm_min = minutes;
+  result->tm_hour = hours;
+}
+
+bool same_hour_minute(tm t1, tm t2) {
+  return t1.tm_min == t2.tm_min && t1.tm_hour == t2.tm_hour;
 }
 
 //Functions below are helpers from https://docs.arduino.cc/tutorials/mkr-1000-wifi/wifi-101-library-examples 
