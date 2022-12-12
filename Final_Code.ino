@@ -3,7 +3,7 @@
 
 //For demo/debugging
 #define DEMO_MODE
-#define VERBOSE 2 //Higher number is more verbose. Ranges from [0-3], with 0 being only errors shown, and 3 being insane amounts of output.
+#define VERBOSE 1 //Higher number is more verbose. Ranges from [0-3], with 0 being only errors shown, and 3 being insane amounts of output.
 
 //For integration and adjustments
 #define CALIBRATE_AT_SUNRISE_SUNSET true
@@ -524,6 +524,15 @@ void setMotor(Motor_Direction direction){
     uint32_t time_now = micros();
     uint32_t motor_on_time = time_now - micros_at_movement;
     //TODO: Handle overflow of micros(), which happens every hour-ish
+    if (motor_on_time > 0xF0000000) {
+      //Assume this is overflow -- We got unlucky :(
+      //To reach this case without overflow, the motor must be on for over 4 minutes, which seems incredibly unlikely.
+      //No handling of this case yet, so just error unfortunately
+      log(0, "ERROR: micros variable overflowed and we didn't have time to put in a special case for this\n");
+      tracking_movement = false;
+      setMotor(Motor_ERR);
+    }
+
     log(3, "Calculated that this movement step has been ocurring for %d micros\n", motor_on_time);
     if (abs((int)last_motor_command) != 1) {
       log(0, "ERROR: last_motor_command was not a direction, so cannot calculate motor offset | Unrecoverable Error\n");
