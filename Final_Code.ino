@@ -199,7 +199,7 @@ void loop() {
     Watchdog.reset();
     log(3, "Reset Watchdog\n");
   }
-  if (loop_counter % 200 == 0 && true) {
+  if ((loop_counter % 200 == 0 && true) || VERBOSE >= 3) {
     log(1, "[%d:%d] photoresistor avg: %d | time since last physical interaction: %d\n", current_time.tm_hour, current_time.tm_min, photoresistor_avg, (millis() - mils_at_last_physical_interaction) / 1000);
   }
   delay(LOOP_INTERVAL);
