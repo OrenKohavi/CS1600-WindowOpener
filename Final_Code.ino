@@ -16,6 +16,12 @@ Recalibrate the thresholds for
 #define DEMO_MODE
 #define VERBOSE 1 //Higher number is more verbose. Ranges from [0-3], with 0 being only errors shown, and 3 being insane amounts of output.
 
+ #define RUN_UNIT_TESTS // uncomment to run unit tests
+
+#ifdef RUN_UNIT_TESTS
+#define MOCK_FUNCTIONS // uncomment to make update_fsm call mock functions
+#endif
+
 //For integration and adjustments
 #define CALIBRATE_AT_SUNRISE_SUNSET true
 #define INVERT_MOTOR_OFF_STATE true
@@ -114,6 +120,13 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(UP_PIN), Button_ISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(DOWN_PIN), Button_ISR, CHANGE);
 
+  #ifdef RUN_UNIT_TESTS
+      while (!Serial);
+      Serial.println("starting unit tests: ");
+      delay(1000);
+      runAllTests(); // runAllTests never exits
+  #endif
+  
   //Connect to WiFi and sync time
   //TODO
 
@@ -124,6 +137,8 @@ void setup() {
   }
   log(1, "Startup Completed\n");
 }
+
+
 
 void loop() {
   //Static Stuff
@@ -542,4 +557,37 @@ void Button_ISR() {
   up_button_state = digitalRead(UP_PIN);
   down_button_state = digitalRead(DOWN_PIN);
   mils_at_last_physical_interaction = millis();
+}
+
+FSM_State test_state;
+Motor_Direction test_direction;
+bool test_up_button;
+bool test_down_button;
+uint32_t test_photo_resister_avg;
+uint32_t test_up_loop_count;
+uint32_t test_down_loop_count;
+
+void resetInput()
+{
+	test_direction = Motor_Direction::Motor_OFF;
+	test_state = FSM_State::S_INIT;
+	test_up_button = false;
+	test_down_button = false;
+	uint32_t test_photo_resister_avg = 300;
+	uint32_t test_up_loop_count = 0;
+	uint32_t test_down_loop_count = 0;
+}
+
+void runAllTests()
+{
+	bool testPassFlag = true;
+	resetInput();
+	// test setting up system
+	test_up_button = true;
+	test_down_button = true;
+	fsmUpdate(test_up_button, test_down_button, false, test_photo_resister_avg, test_up_loop_count, test_down_loop_count);
+	if (test_state != S_WAIT) {
+		testPassFlag = false;
+	}
+	
 }
